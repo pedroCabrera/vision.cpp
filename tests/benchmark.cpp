@@ -12,7 +12,30 @@
 #include <thread>
 #include <vector>
 
-using namespace visp;
+namespace visp {
+using clock = std::chrono::high_resolution_clock;
+using duration_ms = std::chrono::duration<double, std::milli>;
+
+char const* usage = R"(
+Usage: vision-bench [-m <model1>] [-m <model2> ...] [options]
+
+Run benchmarks on one or more vision models and print results as table.
+If no model is specified, benchmarks all supported models.
+
+Options:
+    -m, --model <arch>       Model architecture (sam, birefnet, depthany, ...)
+    -m, --model <arch:file>  Specific model file, eg. "birefnet:BiRefNet-F16.gguf"
+    -b, --backend <cpu|gpu>  Backend type (default: all backends)
+    --timeout <seconds>      Benchmark timeout in seconds (default: 10)
+    --min-iterations <n>     Minimum benchmark iterations (default: 4)
+    --max-iterations <n>     Maximum benchmark iterations (default: 100)
+)";
+
+struct bench_args {
+    duration_ms timeout = duration_ms(10000);
+    int min_iterations = 4;
+    int max_iterations = 100;
+};
 
 struct bench_timings {
     double mean = 0.0;
@@ -85,6 +108,19 @@ bench_timings run_benchmark(
                 transfer_to_backend(transfer.x, transfer.data);
             }
         }
+    }
+    compute(graph, backend);
+
+    auto start = clock::now();
+    int i = 0;
+    for (i = 0; i < args.max_iterations; ++i) {
+        auto start_iteration = clock::now();
+
+        if (include_transfer_each_iter) {
+            for (const auto& transfer : transfers) {
+                transfer_to_backend(transfer.x, transfer.data);
+            }
+        }
         compute(graph, backend);
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -96,10 +132,11 @@ bench_timings run_benchmark(
         }
     }
 
+    duration_ms total = clock::now() - start;
     double mean = std::accumulate(timings.begin(), timings.end(), 0.0) / timings.size();
     double sq_sum = std::inner_product(timings.begin(), timings.end(), timings.begin(), 0.0);
     double stdev = std::sqrt(sq_sum / timings.size() - mean * mean);
-    return {mean, stdev};
+    return {total, duration_ms(mean), duration_ms(stdev), i};
 }
 
 bench_run benchmark_sam(path model_path, backend_device& backend) {
@@ -225,7 +262,10 @@ struct bench_result {
 };
 
 bench_result benchmark_model(
-    std::string_view arch, std::string_view model, backend_device& backend) {
+    std::string_view arch,
+    std::string_view model,
+    backend_device& backend,
+    bench_args const& args) {
 
     bench_result result;
     result.arch = arch;
@@ -294,7 +334,10 @@ void print(fixed_string<128> const& str) {
     printf("%s", str.c_str());
 }
 
+} // namespace visp
+
 int main(int argc, char** argv) {
+    using namespace visp;
     std::vector<std::pair<std::string_view, std::string_view>> models;
     std::vector<std::string_view> backends;
     bool include_transfer_each_iter = false;
@@ -310,7 +353,10 @@ int main(int argc, char** argv) {
 
         for (int i = 1; i < argc; ++i) {
             std::string_view arg(argv[i]);
-            if (arg == "-m" || arg == "--model") {
+            if (arg == "-h" || arg == "--help") {
+                printf("%s", usage);
+                return 0;
+            } else if (arg == "-m" || arg == "--model") {
                 std::string_view text = next_arg(argc, argv, i);
                 auto p = text.find(':');
                 if (p == std::string_view::npos) {
@@ -355,6 +401,12 @@ int main(int argc, char** argv) {
             } else if (arg == "--cuda-cublas") {
                 std::string v = std::string(next_arg(argc, argv, i));
                 opt_cuda_cublas = (v == "on") ? trinary::on : (v == "off" ? trinary::off : trinary::unset);
+            } else if (arg == "--timeout") {
+                args.timeout = duration_ms(std::stod(next_arg(argc, argv, i)) * 1000);
+            } else if (arg == "--min-iterations") {
+                args.min_iterations = std::stoi(next_arg(argc, argv, i));
+            } else if (arg == "--max-iterations") {
+                args.max_iterations = std::stoi(next_arg(argc, argv, i));
             } else {
                 throw std::invalid_argument("Unknown argument: " + std::string(arg));
             }
@@ -414,7 +466,7 @@ int main(int argc, char** argv) {
             backend_device backend_device = initialize_backend(backend);
             for (auto&& model : models) {
                 print(format(
-                    line, "[{: <2}/{: <2}] Running {} on {}...\n", ++i, n_tests, model.first,
+                    line, "[{: <2}/{: <2}] Running {} on {}...", ++i, n_tests, model.first,
                     backend));
 
                 // Run selected model/arch benchmark
