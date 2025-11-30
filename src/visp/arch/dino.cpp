@@ -1,7 +1,10 @@
 #include "visp/arch/dino.h"
 #include "util/math.h"
+#include "util/string.h"
 #include "visp/ml.h"
 #include "visp/nn.h"
+
+#include <charconv>
 
 namespace visp {
 namespace dino {
@@ -20,32 +23,54 @@ tensor interpolate_pos_encoding(model_ref m, tensor x, int64_t w, int64_t h, int
     i64x2 target = i64x2{w, h} / patch_size;
     int64_t sqrt_n = int64_t(std::sqrt(float(n)) + 0.01f);
 
-    patch_embed = ggml_reshape_4d(m, patch_embed, dim, sqrt_n, sqrt_n, 1);
+    patch_embed = ggml_cont(m, ggml_reshape_4d(m, patch_embed, dim, sqrt_n, sqrt_n, 1));
     patch_embed = ggml_cont(m, permute_cwhn_to_whcn(m, patch_embed));
+    // Ensure GPU bicubic interpolation runs in F32 to improve numerical stability
+    ggml_type pe_orig = patch_embed->type;
+    if ((m.backend == backend_type::cuda || m.backend == backend_type::vulkan) && pe_orig != GGML_TYPE_F32) {
+        patch_embed = ensure_tensor_type(m, patch_embed, GGML_TYPE_F32);
+    }
     patch_embed = interpolate(m, patch_embed, target, GGML_SCALE_MODE_BICUBIC);
+    if (patch_embed->type != pe_orig) {
+        patch_embed = ensure_tensor_type(m, patch_embed, pe_orig);
+    }
     patch_embed = ggml_cont(m, permute_whcn_to_cwhn(m, patch_embed));
-    patch_embed = ggml_reshape_3d(m, patch_embed, dim, target[0] * target[1], 1);
+    patch_embed = ggml_cont(m, ggml_cont(m, ggml_reshape_3d(m, patch_embed, dim, target[0] * target[1], 1)));
     return concat(m, {class_embed, patch_embed}, 1);
 }
 
 tensor prepare_tokens(model_ref m, tensor x, int patch_size) {
     auto [c, w, h, n] = nelements(x);
+
     x = patch_embed(m["patch_embeddings"], x, patch_size);
-    x = ggml_reshape_3d(m, x, x->ne[0], x->ne[1] * x->ne[2], x->ne[3]);
+    x = ggml_cont(m, ggml_reshape_3d(m, x, x->ne[0], x->ne[1] * x->ne[2], x->ne[3]));
 
     tensor cls_token = m.weights("cls_token");
+    // Align class token dtype with activations before concatenation
+    if (cls_token->type != x->type) {
+        cls_token = ensure_tensor_type(m, cls_token, x->type);
+    }
     if (cls_token->ne[2] != n) {
         cls_token = ggml_repeat_4d(m, cls_token, cls_token->ne[0], 1, n, 1);
+        cls_token = ggml_cont(m, cls_token);
     }
     x = concat(m, {cls_token, x}, 1);
+    x = ggml_cont(m, x);
 
     tensor pos_enc = interpolate_pos_encoding(m, x, w, h, patch_size);
-    x = ggml_add_inplace(m, x, pos_enc);
-    return x;
+    // Ensure positional encodings match token dtype before addition
+    if (pos_enc->type != x->type) {
+        pos_enc = ensure_tensor_type(m, pos_enc, x->type);
+    }
+    tensor sum = ggml_add(m, x, pos_enc);
+    return ggml_cont(m, sum);
 }
 
 tensor layer_scale(model_ref m, tensor x) {
-    return ggml_mul(m, x, m.weights("lambda1"));
+    tensor lambda = m.weights("lambda1");
+    lambda = ensure_tensor_type(m, lambda, x->type);
+    lambda = ggml_cont(m, lambda);
+    return ggml_mul(m, x, lambda);
 }
 
 tensor mlp(model_ref m, tensor x) {
@@ -63,7 +88,7 @@ tensor attention(model_ref m, tensor x, int n_heads) {
 
     auto split = [=](model_ref m, tensor x, ggml_type type, bool transpose = false) mutable {
         x = linear(m, x);
-        x = ggml_reshape_4d(m, x, c / n_heads, n_heads, n, b);
+        x = ggml_cont(m, ggml_reshape_4d(m, x, c / n_heads, n_heads, n, b));
         x = transpose ? ggml_permute(m, x, 1, 2, 0, 3) : ggml_permute(m, x, 0, 2, 1, 3);
         return ggml_cast(m, x, type);
     };
@@ -82,7 +107,7 @@ tensor attention(model_ref m, tensor x, int n_heads) {
         x = ggml_cont(m, ggml_permute(m, x, 0, 2, 1, 3));
     }
 
-    x = ggml_reshape_3d(m, x, c, n, b);
+    x = ggml_cont(m, ggml_reshape_3d(m, x, c, n, b));
     x = linear(m["output.dense"], x);
     return named(m, x);
 }

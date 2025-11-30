@@ -33,6 +33,7 @@ enum class backend_type {
     cpu = 1,
     gpu = 2,
     vulkan = gpu | 1 << 8,
+    cuda = gpu | 1 << 9,
 };
 
 constexpr bool operator&(backend_type a, backend_type b);
@@ -79,6 +80,21 @@ enum class model_build_flag {
 using model_build_flags = flags<model_build_flag>;
 
 VISP_API model_build_flags backend_default_flags(backend_type);
+
+// Runtime options (settable via host application flags instead of environment variables)
+// These must be called BEFORE the first backend is initialized (before backend_init/load).
+// If not called, sensible defaults per backend are used.
+
+// Enable/disable CUDA Graphs integration in ggml-cuda. When disabled, we set the
+// GGML_CUDA_DISABLE_GRAPHS environment variable internally for this process.
+VISP_API void visp_set_cuda_graphs_enabled(bool enable);
+
+// Allow keeping FP16 for CUDA bilinear/bicubic interpolation when safe. Default: disabled.
+VISP_API void visp_set_cuda_allow_f16_interpolation(bool allow);
+
+// Force flash attention on or off across backends that support it. If you don't call this,
+// the default is chosen per-backend by backend_default_flags().
+VISP_API void visp_set_flash_attention_enabled(bool enable);
 
 //
 // Model file - holds the contents of a GGUF file
@@ -182,6 +198,7 @@ struct VISP_API model_ref {
     ggml_cgraph* graph = nullptr;
     model_build_flags flags;
     tensor_name prefix;
+    backend_type backend = backend_type::cpu;
 
     model_ref() = default;
     model_ref(model_weights&);
@@ -192,7 +209,8 @@ struct VISP_API model_ref {
         ggml_context* graph_context = nullptr,
         ggml_cgraph* graph = nullptr,
         model_build_flags flags = {},
-        tensor_name prefix = {});
+        tensor_name prefix = {},
+        backend_type backend = backend_type::cpu);
 
     // Find weights tensor by name, prepends the current prefix.
     tensor find(char const* name) const;    // returns null if not found

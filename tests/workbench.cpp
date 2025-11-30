@@ -10,7 +10,13 @@
 
 #include <ggml-blas.h>
 #include <ggml-cpu.h>
+#if defined(VISP_CUDA)
+#include <ggml-cuda.h>
+#endif
+
+#if defined(VISP_VULKAN)
 #include <ggml-vulkan.h>
+#endif
 #include <ggml.h>
 
 #include <cassert>

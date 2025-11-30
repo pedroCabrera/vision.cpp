@@ -136,6 +136,38 @@ tensor aspp_deformable(model_ref m, tensor x) {
     return named(m, x);
 }
 
+// On some CUDA paths with larger BiRefNet variants, elementwise MUL in F16 can
+// trigger a kernel launch configuration error. Promote to F32 for the MUL and
+// cast back to preserve the original dtype.
+static inline tensor cuda_safe_mul(model_ref m, tensor a, tensor b) {
+    // If types differ, prefer casting b to a's type on non-CUDA paths
+    if (m.backend != backend_type::cuda) {
+        if (a->type != b->type) {
+            b = ggml_cast(m, b, a->type);
+        }
+        return ggml_mul(m, a, b);
+    }
+
+    // CUDA path: promote float muls to F32 when not already F32
+    auto is_float = [](ggml_type t) {
+        return t == GGML_TYPE_F32 || t == GGML_TYPE_F16;
+    };
+    ggml_type a_orig = a->type;
+    bool can_float_mul = is_float(a->type) && is_float(b->type);
+    if (can_float_mul && a->type != GGML_TYPE_F32) {
+        tensor ac = ggml_cast(m, a, GGML_TYPE_F32);
+        tensor bc = ggml_cast(m, b, GGML_TYPE_F32);
+        tensor yc = ggml_mul(m, ac, bc);
+        return ggml_cast(m, yc, a_orig);
+    }
+
+    // Otherwise ensure same type and do the mul
+    if (a->type != b->type) {
+        b = ggml_cast(m, b, a->type);
+    }
+    return ggml_mul(m, a, b);
+}
+
 tensor basic_decoder_block(model_ref m, tensor x) {
     x = conv_2d_batch_norm(m["conv_in"], x, 1, 1);
     x = ggml_relu_inplace(m, x);
@@ -189,7 +221,7 @@ tensor decode(model_ref m, tensor x, swin_result const& features) {
     tensor p4_gdt = gdt_conv(m["gdt_convs_4"], p4);
     tensor gdt_attn_4 = conv_2d(m["gdt_convs_attn_4.0"], p4_gdt);
     gdt_attn_4 = ggml_sigmoid(m, gdt_attn_4);
-    p4 = ggml_mul(m, p4, gdt_attn_4);
+    p4 = cuda_safe_mul(m, p4, gdt_attn_4);
 
     x3 = conv_2d(m["lateral_block4.conv"], x3);
     tensor _p4 = upscale_to(m, p4, x3);
@@ -206,7 +238,7 @@ tensor decode(model_ref m, tensor x, swin_result const& features) {
     tensor p3_gdt = gdt_conv(m["gdt_convs_3"], p3);
     tensor gdt_attn_3 = conv_2d(m["gdt_convs_attn_3.0"], p3_gdt);
     gdt_attn_3 = ggml_sigmoid(m, gdt_attn_3);
-    p3 = ggml_mul(m, p3, gdt_attn_3);
+    p3 = cuda_safe_mul(m, p3, gdt_attn_3);
 
     _p3 = upscale_to(m, p3, x2);
     x2 = conv_2d(m["lateral_block3.conv"], x2);
@@ -223,7 +255,7 @@ tensor decode(model_ref m, tensor x, swin_result const& features) {
     tensor p2_gdt = gdt_conv(m["gdt_convs_2"], p2);
     tensor gdt_attn2 = conv_2d(m["gdt_convs_attn_2.0"], p2_gdt);
     gdt_attn2 = ggml_sigmoid(m, gdt_attn2);
-    p2 = ggml_mul(m, p2, gdt_attn2);
+    p2 = cuda_safe_mul(m, p2, gdt_attn2);
 
     _p2 = upscale_to(m, p2, x1);
     x1 = conv_2d(m["lateral_block2.conv"], x1);

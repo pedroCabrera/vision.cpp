@@ -129,7 +129,11 @@ struct box_2d {
 
 // Loads a SAM model from GGUF file onto the backend device.
 // * only supports MobileSAM (TinyViT) for now
-VISP_API sam_model sam_load_model(char const* filepath, backend_device const&);
+// Weight type selection:
+// Pass GGML_TYPE_COUNT (default) to use backend_device::preferred_float_type().
+// Otherwise explicitly choose GGML_TYPE_F16 or GGML_TYPE_F32.
+VISP_API sam_model sam_load_model(
+    char const* filepath, backend_device const&, ggml_type weight_type = GGML_TYPE_COUNT);
 
 // Creates an image embedding from RGB input, required for subsequent `sam_compute` calls.
 VISP_API void sam_encode(sam_model&, image_view image);
@@ -174,7 +178,8 @@ struct birefnet_model;
 // * supports BiRefNet, BiRefNet-lite, BiRefNet-Matting variants at 1024px resolution
 // * supports BiRefNet-HR variant at 2048px resolution
 // * supports BiRefNet-dynamic variant at arbitrary resolution
-VISP_API birefnet_model birefnet_load_model(char const* filepath, backend_device const&);
+VISP_API birefnet_model birefnet_load_model(
+    char const* filepath, backend_device const&, ggml_type weight_type = GGML_TYPE_COUNT);
 
 // Takes RGB input and computes an alpha mask with foreground as 1.0 and background as 0.0.
 VISP_API image_data birefnet_compute(birefnet_model&, image_view image);
@@ -209,7 +214,8 @@ struct depthany_model;
 
 // Loads a Depth Anything V2 model from GGUF file onto the backend device.
 // * supports Small/Base/Large variants with flexible input resolution
-VISP_API depthany_model depthany_load_model(char const* filepath, backend_device const&);
+VISP_API depthany_model depthany_load_model(
+    char const* filepath, backend_device const&, ggml_type weight_type = GGML_TYPE_COUNT);
 
 // Takes RGB input and computes estimated depth (distance from camera).
 // Output is a single-channel float32 image in range [0, 1.0].
@@ -242,7 +248,8 @@ struct migan_model;
 
 // Loads a MI-GAN model from GGUF file onto the backend device.
 // * supports variants at 256px or 512px resolution
-VISP_API migan_model migan_load_model(char const* filepath, backend_device const&);
+VISP_API migan_model migan_load_model(
+    char const* filepath, backend_device const&, ggml_type weight_type = GGML_TYPE_COUNT);
 
 // Fills pixels in the input image where the mask is 1.0 with new content.
 VISP_API image_data migan_compute(migan_model&, image_view image, image_view mask);
@@ -270,7 +277,8 @@ struct esrgan_model;
 // Loads an ESRGAN model from GGUF file onto the backend device.
 // * supports ESRGAN, RealESRGAN variants with flexible scale and number of blocks
 // * currently does not spport RealESRGAN+ (plus) models or those which use pixel shuffle
-VISP_API esrgan_model esrgan_load_model(char const* filepath, backend_device const&);
+VISP_API esrgan_model esrgan_load_model(
+    char const* filepath, backend_device const&, ggml_type weight_type = GGML_TYPE_COUNT);
 
 // Upscales the input image by the model's scale factor. Uses tiling for large inputs.
 VISP_API image_data esrgan_compute(esrgan_model&, image_view image);

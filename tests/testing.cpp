@@ -11,6 +11,12 @@ namespace visp {
 // Globals
 float tolerance = 1e-5f;
 std::string extra_info;
+static bool g_verbose = false;
+bool test_is_verbose() { return g_verbose; }
+
+// Tests CLI options
+static test_weights_choice g_weights_choice = test_weights_choice::def;
+test_weights_choice test_get_weights_choice() { return g_weights_choice; }
 } // namespace visp
 
 #ifndef VISP_TEST_NO_MAIN
@@ -29,7 +35,9 @@ int main(int argc, char** argv) {
 
     std::string_view filter;
     bool exclude_gpu = false;
+    bool only_gpu = false;
     bool verbose = false;
+    std::string weights_flag; // "def" | "f16" | "f32" | "all"
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg(argv[i]);
@@ -37,12 +45,26 @@ int main(int argc, char** argv) {
             verbose = true;
         } else if (arg == "--no-gpu") {
             exclude_gpu = true;
+        } else if (arg == "--only-gpu") {
+            only_gpu = true;
+        } else if (arg == "--weights") {
+            weights_flag = std::string(argv[++i]);
         } else {
             filter = arg;
         }
     }
 
+    // Apply weights flag if provided
+    if (!weights_flag.empty()) {
+        using enum visp::test_weights_choice;
+        if (weights_flag == "f16") visp::g_weights_choice = f16;
+        else if (weights_flag == "f32") visp::g_weights_choice = f32;
+        else if (weights_flag == "all") visp::g_weights_choice = all;
+        else visp::g_weights_choice = def;
+    }
+
     auto run = [&](test_case const& test, char const* name, backend_type backend) {
+        auto t0 = steady_clock::now();
         try {
             if (!filter.empty() && name != filter && test.name != filter) {
                 return; // test not selected
@@ -58,13 +80,17 @@ int main(int argc, char** argv) {
                 test.func();
             }
 
+            auto t1 = steady_clock::now();
+            long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
             ++passed;
             if (verbose) {
-                printf(" %s\n", "\033[32mPASSED\033[0m");
+                printf(" %s (%lldms)\n", "\033[32mPASSED\033[0m", ms);
             }
         } catch (const visp::test_failure& e) {
+            auto t1 = steady_clock::now();
+            long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
             ++failed;
-            printf("%s %s\n", verbose ? "" : name, "\033[31mFAILED\033[0m");
+            printf("%s %s (%lldms)\n", verbose ? "" : name, "\033[31mFAILED\033[0m", ms);
             printf("  \033[90m%s:%d:\033[0m Assertion failed\n", e.file, e.line);
             printf("  \033[93m%s\033[0m\n", e.condition);
             if (e.eval) {
@@ -74,18 +100,24 @@ int main(int argc, char** argv) {
                 printf("  %s\n", visp::extra_info.c_str());
             }
         } catch (const visp::test_skip&) {
+            auto t1 = steady_clock::now();
+            long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
             ++skipped;
             if (verbose) {
-                printf(" %s\n", "\033[33mSKIPPED\033[0m");
+                printf(" %s (%lldms)\n", "\033[33mSKIPPED\033[0m", ms);
             }
         } catch (const std::exception& e) {
+            auto t1 = steady_clock::now();
+            long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
             ++errors;
-            printf("%s %s\n", verbose ? "" : name, "\033[31mERROR\033[0m");
+            printf("%s %s (%lldms)\n", verbose ? "" : name, "\033[31mERROR\033[0m", ms);
             printf("  \033[90m%s:%d:\033[0m Unhandled exception\n", test.file, test.line);
             printf("  \033[93m%s\033[0m\n", e.what());
         } catch (...) {
+            auto t1 = steady_clock::now();
+            long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
             ++errors;
-            printf("%s %s\n", verbose ? "" : name, "\033[31mERROR\033[0m");
+            printf("%s %s (%lldms)\n", verbose ? "" : name, "\033[31mERROR\033[0m", ms);
             printf("  \033[90m%s:%d:\033[0m Unhandled exception\n", test.file, test.line);
         }
         visp::extra_info.clear();
@@ -94,9 +126,13 @@ int main(int argc, char** argv) {
     auto time_start = steady_clock::now();
     fixed_string<128> name;
 
+    visp::g_verbose = verbose;
+
     for (auto& test : registry.tests) {
         if (test.is_backend_test) {
-            run(test, format(name, "{}[cpu]", test.name), backend_type::cpu);
+            if (!only_gpu) {
+                run(test, format(name, "{}[cpu]", test.name), backend_type::cpu);
+            }
             if (!exclude_gpu) {
                 run(test, format(name, "{}[gpu]", test.name), backend_type::gpu);
             }

@@ -30,13 +30,21 @@ tensor downsample_2d(model_ref m, tensor x) {
 }
 
 tensor upsample_2d(model_ref m, tensor x) {
-    tensor filter = m.weights("filter_const");
+    tensor filter = ensure_tensor_type(m, m.weights("filter_const"), x->type);
     if (m.flags & model_build_flag::cwhn) {
         filter = ggml_reshape_4d(m, filter, 1, filter->ne[0], filter->ne[1], 1);
+    }
+    if (m.backend == backend_type::cuda) {
+        // CUDA requires broadcast operands to be contiguous for binary ops
+        filter = ggml_cont(m, filter);
     }
 
     auto [w, h, c, n] = nelements_whcn(m, x);
     x = interpolate(m, x, {w * 2, h * 2}, GGML_SCALE_MODE_NEAREST);
+    // CUDA workaround: ensure contiguity after interpolate
+    if (m.backend == backend_type::cuda) {
+        x = ggml_cont(m, x);
+    }
     x = ggml_mul_inplace(m, x, filter);
     x = conv_2d_depthwise(m["filter"], x, 1, 2); // 4x4 filter
 
@@ -68,10 +76,26 @@ tensor separable_conv_2d(model_ref m, tensor x, flags<conv> flags) {
     }
 
     if (flags & conv::noise) {
-        tensor noise = m.weights("noise_const");
-        noise = ggml_mul_inplace(m, noise, m.weights("noise_strength"));
+        tensor noise = ensure_tensor_type(m, m.weights("noise_const"), x->type);
+        tensor noise_strength = ensure_tensor_type(m, m.weights("noise_strength"), noise->type);
+        if (m.backend == backend_type::cuda) {
+            // Broadcast tensors need dense stride for CUDA binary kernels
+            noise_strength = ggml_cont(m, noise_strength);
+        }
+        noise = ggml_mul_inplace(m, noise, noise_strength);
+        if (m.backend == backend_type::cuda) {
+            noise = ggml_cont(m, noise);
+        }
         if (m.flags & model_build_flag::cwhn) {
             noise = ggml_reshape_4d(m, noise, 1, noise->ne[0], noise->ne[1], 1);
+            // CUDA workaround: reshape creates misaligned strides
+            if (m.backend == backend_type::cuda) {
+                noise = ggml_cont(m, noise);
+            }
+        }
+        // CUDA workaround: ensure contiguity before add
+        if (m.backend == backend_type::cuda) {
+            x = ggml_cont(m, x);
         }
         x = ggml_add_inplace(m, x, noise);
     }

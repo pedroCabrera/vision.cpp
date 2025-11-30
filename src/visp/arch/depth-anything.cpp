@@ -18,15 +18,23 @@ tensor residual_conv(model_ref m, tensor x) {
     out = conv_2d(m["convolution1"], out, 1, 1);
     out = ggml_relu(m, out);
     out = conv_2d(m["convolution2"], out, 1, 1);
-    x = ggml_add_inplace(m, x, out);
-    return named(m, x);
+    // Ensure residual matches input dtype before add
+    if (out->type != x->type) {
+        out = ensure_tensor_type(m, out, x->type);
+    }
+    tensor result = ggml_add(m, x, out);
+    return named(m, result);
 }
 
 tensor feature_fusion(model_ref m, tensor x0, tensor x1, int64_t const* size) {
     tensor x = x0;
     if (x1) {
         tensor res = residual_conv(m["residual_layer1"], x1);
-        x = ggml_add_inplace(m, x, res);
+        // Align dtype of residual to current feature map before add
+        if (res->type != x->type) {
+            res = ensure_tensor_type(m, res, x->type);
+        }
+        x = ggml_add(m, x, res);
     }
     x = residual_conv(m["residual_layer2"], x);
 
@@ -34,7 +42,15 @@ tensor feature_fusion(model_ref m, tensor x0, tensor x1, int64_t const* size) {
     int64_t w = size ? size[dim + 0] : x->ne[dim + 0] * 2;
     int64_t h = size ? size[dim + 1] : x->ne[dim + 1] * 2;
     x = contiguous_2d_to_whcn(m, x);
+    // Ensure GPU bilinear upscale runs in F32 to avoid precision drift
+    ggml_type orig_t = x->type;
+    if ((m.backend == backend_type::cuda || m.backend == backend_type::vulkan) && orig_t != GGML_TYPE_F32) {
+        x = ensure_tensor_type(m, x, GGML_TYPE_F32);
+    }
     x = interpolate(m, x, {w, h}, bilinear_align_corners);
+    if (x->type != orig_t) {
+        x = ensure_tensor_type(m, x, orig_t);
+    }
     x = whcn_to_contiguous_2d(m, x);
 
     x = conv_2d(m["projection"], x);
@@ -49,17 +65,22 @@ tensor neck(model_ref m, span<tensor> features, int64_t patch_w, int64_t patch_h
     for (int i = 0; i < 4; ++i) {
         tensor x = features[i];
         x = slice(m, x, {}, {1, x->ne[1]}, {}, {});
-        x = ggml_reshape_4d(m, x, x->ne[0], patch_w, patch_h, x->ne[3]);
+        x = ggml_cont(m, ggml_reshape_4d(m, x, x->ne[0], patch_w, patch_h, x->ne[3]));
 
         model_ref proj = reassemble[i]["projection"];
         proj.flags |= model_build_flag::cwhn;
         x = conv_2d(proj, x); // 1x1 conv, keep CWHN layout and directly use mul_mat
 
         x = cwhn_to_contiguous_2d(m, x);
+        ggml_type in_type = x->type;
         switch (i) {
             case 0: x = conv_transpose_2d(reassemble[i]["resize"], x, 4); break;
             case 1: x = conv_transpose_2d(reassemble[i]["resize"], x, 2); break;
             case 3: x = conv_2d(reassemble[i]["resize"], x, 2, 1); break;
+        }
+        // On CUDA, conv_transpose_2d upsamples with F32 math; cast back to incoming dtype
+        if ((i == 0 || i == 1) && x->type != in_type) {
+            x = ensure_tensor_type(m, x, in_type);
         }
         layer[i] = x;
     }
@@ -67,6 +88,14 @@ tensor neck(model_ref m, span<tensor> features, int64_t patch_w, int64_t patch_h
     model_ref convs = m["convs"];
     for (int i = 0; i < 4; ++i) {
         layer[i] = conv_2d(convs[i], layer[i], 1, 1);
+    }
+
+    // Normalize dtypes across pyramid features before fusion to avoid mixed-type ops
+    ggml_type dtype_ref = layer[3]->type;
+    for (int i = 0; i < 4; ++i) {
+        if (layer[i]->type != dtype_ref) {
+            layer[i] = ensure_tensor_type(m, layer[i], dtype_ref);
+        }
     }
 
     model_ref fusion = m["fusion_stage.layers"];
@@ -81,7 +110,15 @@ tensor neck(model_ref m, span<tensor> features, int64_t patch_w, int64_t patch_h
 tensor head(model_ref m, tensor x, int64_t w, int64_t h, float max_depth) {
     tensor out = conv_2d(m["conv1"], x, 1, 1);
     out = contiguous_2d_to_whcn(m, out);
+    // Ensure GPU bilinear upscale runs in F32 to avoid precision drift
+    ggml_type out_orig = out->type;
+    if ((m.backend == backend_type::cuda || m.backend == backend_type::vulkan) && out_orig != GGML_TYPE_F32) {
+        out = ensure_tensor_type(m, out, GGML_TYPE_F32);
+    }
     out = interpolate(m, out, {w, h}, bilinear_align_corners);
+    if (out->type != out_orig) {
+        out = ensure_tensor_type(m, out, out_orig);
+    }
     out = whcn_to_contiguous_2d(m, out);
 
     out = conv_2d(m["conv2"], out, 1, 1);

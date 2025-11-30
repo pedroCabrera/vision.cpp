@@ -74,6 +74,10 @@ struct test_with_tolerance {
 
 void test_set_info(std::string_view);
 
+// Optional CLI controls for tests (parsed in testing.cpp)
+enum class test_weights_choice { def, f16, f32, all };
+test_weights_choice test_get_weights_choice();
+
 template <typename T>
 bool test_is_equal(T const& a, T const& b) {
     if constexpr (std::is_floating_point_v<T>) {
@@ -99,6 +103,11 @@ test_failure test_failure_not_equal(
 test_failure test_failure_image_mismatch(char const* file, int line, char const*, float rms);
 
 } // namespace visp
+
+// Query whether tests are running in verbose mode (set by main in testing.cpp)
+namespace visp {
+bool test_is_verbose();
+}
 
 #define VISP_TEST(name)                                                                            \
     void test_func_##name();                                                                       \

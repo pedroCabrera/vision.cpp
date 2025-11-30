@@ -7,22 +7,71 @@
 #include <thread>
 #include <vector>
 
+#if defined(VISP_CUDA)
+#include <ggml-cuda.h>
+#endif
+
+#if defined(VISP_VULKAN)
+#include <ggml-vulkan.h>
+#endif
+
 namespace visp {
 
 //
 // backend
+
+namespace {
+
+// Global runtime overrides set by host apps (default to "no override").
+// For booleans, -1 means use default behavior; 0 = false; 1 = true.
+static int g_cuda_graphs_enabled = -1;       // -1 = default, 0 = disabled, 1 = enabled
+static int g_cuda_allow_f16_interp = 0;      // default: disabled
+static int g_flash_attention_enabled = -1;   // -1 = default per-backend, 0 = off, 1 = on
+
+void disable_cuda_graphs_if_needed() {
+#if defined(VISP_CUDA)
+    static bool configured = false;
+    if (configured) {
+        return;
+    }
+    // Decide whether to enable or disable graphs based on runtime override or defaults
+    int enable_graphs = g_cuda_graphs_enabled;
+    if (enable_graphs == -1) {
+        // No override set by application; choose build-time default
+        // If build opted into CUDA graphs, leave enabled by default; else disable by default
+        #if defined(VISP_CUDA_GRAPHS)
+            enable_graphs = 1;
+        #else
+            enable_graphs = 0;
+        #endif
+    }
+    // ggml-cuda controls this via GGML_CUDA_DISABLE_GRAPHS env; set it programmatically
+    #if defined(_WIN32)
+        _putenv_s("GGML_CUDA_DISABLE_GRAPHS", enable_graphs ? "0" : "1");
+    #else
+        setenv("GGML_CUDA_DISABLE_GRAPHS", enable_graphs ? "0" : "1", 1);
+    #endif
+    configured = true;
+#endif
+}
+
+} // namespace
 
 std::string_view to_string(backend_type type) {
     switch (type) {
         case backend_type::cpu: return "cpu";
         case backend_type::gpu: return "gpu";
         case backend_type::vulkan: return "vulkan";
+        case backend_type::cuda: return "cuda";
         default: return "unknown";
     }
 }
 
 bool load_ggml_backends() {
     static const bool loaded = []() {
+        #if defined(VISP_CUDA)
+            disable_cuda_graphs_if_needed();
+        #endif
         if (ggml_backend_reg_count() > 0) {
             return true; // already loaded
         }
@@ -50,6 +99,10 @@ bool backend_is_available(backend_type type) {
             ggml_backend_reg_t reg = ggml_backend_reg_by_name("Vulkan");
             return reg && ggml_backend_reg_dev_count(reg) > 0;
         }
+        case backend_type::cuda: {
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+            return reg && ggml_backend_reg_dev_count(reg) > 0;
+        }
         default: ASSERT(false, "Invalid backend type");
     }
     return false;
@@ -73,12 +126,35 @@ backend_device backend_init(backend_type type) {
             b.handle.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
             break;
         case backend_type::gpu:
-        case backend_type::vulkan:
             b.handle.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr));
             if (!b.handle) {
                 b.handle.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr));
             }
             break;
+        case backend_type::vulkan: {
+            ggml_backend_reg_t vk_reg = ggml_backend_reg_by_name("Vulkan");
+            if (vk_reg) {
+                if (ggml_backend_reg_dev_count(vk_reg) > 0) {
+                    ggml_backend_dev_t vk_dev = ggml_backend_reg_dev_get(vk_reg, 0);
+                    if (vk_dev) {
+                        b.handle.reset(ggml_backend_dev_init(vk_dev, nullptr));
+                    }
+                }
+            }
+            break;
+        }
+        case backend_type::cuda: {
+            ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
+            if (cuda_reg) {
+                if (ggml_backend_reg_dev_count(cuda_reg) > 0) {
+                    ggml_backend_dev_t cuda_dev = ggml_backend_reg_dev_get(cuda_reg, 0);
+                    if (cuda_dev) {
+                        b.handle.reset(ggml_backend_dev_init(cuda_dev, nullptr));
+                    }
+                }
+            }
+            break;
+        }
         default: ASSERT(false, "Invalid backend type");
     }
     if (!b.handle) {
@@ -98,6 +174,9 @@ backend_type backend_device::type() const {
         case GGML_BACKEND_DEVICE_TYPE_GPU:
         case GGML_BACKEND_DEVICE_TYPE_IGPU: {
             std::string_view dev_name = ggml_backend_dev_name(dev);
+            if (dev_name.find("CUDA") != std::string_view::npos) {
+                return backend_type::cuda;
+            }
             if (dev_name.find("Vulkan") != std::string_view::npos) {
                 return backend_type::vulkan;
             }
@@ -128,6 +207,9 @@ tensor_data_layout backend_device::preferred_layout() const {
     if (type() & backend_type::cpu) {
         return tensor_data_layout::cwhn;
     }
+    if (type() == backend_type::cuda) {
+        return tensor_data_layout::whcn;
+    }
     return tensor_data_layout::unknown; // no preference, keep model weight layout
 }
 
@@ -140,8 +222,10 @@ size_t backend_device::total_memory() const {
 
 size_t backend_device::max_alloc() const {
     const size_t vulkan_max = 4 * 1024 * 1024 * 1024ULL; // TODO: query from backend
+    const size_t cuda_max = 8 * 1024 * 1024 * 1024ULL;   // TODO: query from backend
     switch (type()) {
         case backend_type::vulkan: return vulkan_max;
+        case backend_type::cuda: return cuda_max;
         default: return SIZE_MAX;
     }
 }
@@ -162,10 +246,9 @@ void backend_set_n_threads(backend_device& b, int n_threads) {
 // model_build_flags
 
 model_build_flags flash_attn_flag(bool default_enabled) {
-    static char const* const env = getenv("VISP_FLASH_ATTENTION");
-    if (env && env[0] == '1') {
+    if (g_flash_attention_enabled == 1) {
         return model_build_flag::flash_attention;
-    } else if (env && env[0] == '0') {
+    } else if (g_flash_attention_enabled == 0) {
         return model_build_flags{};
     }
     return default_enabled ? model_build_flag::flash_attention : model_build_flags{};
@@ -179,6 +262,7 @@ model_build_flags backend_default_flags(backend_type type) {
                 flash_attn_flag(false);
         case backend_type::gpu:
         case backend_type::vulkan: return flash_attn_flag(true);
+        case backend_type::cuda: return flash_attn_flag(false);
     }
     return {};
 }
@@ -333,7 +417,19 @@ void permute_whcn_to_cwhn(T* n, bool depthwise) {
     }
 }
 
+template <typename T>
+void permute_cwhn_to_whcn(T* n, bool depthwise) {
+    if (depthwise) { // c1wh -> wh1c
+        T perm[] = {n[2], n[3], n[1], n[0]};
+        std::copy(perm, perm + 4, n);
+    } else {
+        std::swap(n[1], n[2]); // -> chw n -> c h wn
+        std::swap(n[0], n[2]); // -> whcn
+    }
+}
+
 struct tensor_converter {
+    ggml_context* weights_ctx = nullptr;
     ggml_type src_type;
     ggml_type dst_type;
     ggml_backend_ptr backend;
@@ -342,19 +438,30 @@ struct tensor_converter {
     ggml_gallocr_ptr gallocr;
     ggml_tensor convert_src{};
     ggml_tensor* convert_dst;
+    int layout_conversion;
+    bool enabled = false;
 
-    tensor_converter(ggml_context* weights, ggml_type target_type, bool whcn_to_cwhn)
-        : dst_type(target_type) {
+    tensor_converter(ggml_context* weights, ggml_type target_type, int layout_conv)
+        : weights_ctx(weights), dst_type(target_type), layout_conversion(layout_conv) {
 
-        if (dst_type == GGML_TYPE_COUNT && !whcn_to_cwhn) {
-            return;
-        }
         src_type = detect_float_type(weights);
-        if (src_type == dst_type && !whcn_to_cwhn) {
-            return;
-        }
         if (dst_type == GGML_TYPE_COUNT) {
             dst_type = src_type;
+        }
+
+        bool type_conversion = is_float_type(src_type) && dst_type != GGML_TYPE_COUNT && dst_type != src_type;
+        bool layout_change = layout_conversion != 0;
+        enabled = type_conversion || layout_change;
+        if (!enabled) {
+            return;
+        }
+
+        initialize_graph();
+    }
+
+    void initialize_graph() {
+        if (ctx) {
+            return;
         }
 
         ggml_init_params ctx_params{
@@ -363,7 +470,7 @@ struct tensor_converter {
             .no_alloc = true};
         ctx.reset(ggml_init(ctx_params));
 
-        size_t max_elem = max_tensor_elements(weights);
+        size_t max_elem = max_tensor_elements(weights_ctx);
         graph = ggml_new_graph_custom(ctx.get(), 2, false);
         convert_src.type = src_type;
         convert_src.ne[0] = max_elem;
@@ -389,10 +496,18 @@ struct tensor_converter {
         return dst_type;
     }
 
-    void const* operator()(ggml_tensor const* src, ggml_tensor const* dst, bool whcn_to_cwhn) {
-        bool need_type_conv = is_float_type(src->type) && src->type != dst_type;
-        if (dst_type == GGML_TYPE_COUNT || !(need_type_conv || whcn_to_cwhn)) {
+    void const* operator()(ggml_tensor const* src, ggml_tensor const* dst, bool convert_layout) {
+        ggml_type dst_tensor_type = target_type(dst);
+        bool need_type_conv = is_float_type(src->type) && src->type != dst_tensor_type;
+        bool need_layout_conv = convert_layout && layout_conversion != 0;
+        if (dst_type == GGML_TYPE_COUNT && !need_layout_conv) {
             return src->data;
+        }
+        if (!need_type_conv && !need_layout_conv) {
+            return src->data;
+        }
+        if (!ctx) {
+            initialize_graph();
         }
         ASSERT(ctx, "Weights contain tensors that would require conversion");
 
@@ -400,15 +515,20 @@ struct tensor_converter {
         convert_src.data = src->data;
         std::copy(src->ne, src->ne + GGML_MAX_DIMS, convert_src.ne);
         std::copy(src->nb, src->nb + GGML_MAX_DIMS, convert_src.nb);
-        if (whcn_to_cwhn) {
+        if (need_layout_conv) {
             bool depthwise = convert_src.ne[2] == 1;
-            permute_whcn_to_cwhn(convert_src.ne, depthwise);
-            permute_whcn_to_cwhn(convert_src.nb, depthwise);
+            if (layout_conversion > 0) {
+                permute_whcn_to_cwhn(convert_src.ne, depthwise);
+                permute_whcn_to_cwhn(convert_src.nb, depthwise);
+            } else if (layout_conversion < 0) {
+                permute_cwhn_to_whcn(convert_src.ne, depthwise);
+                permute_cwhn_to_whcn(convert_src.nb, depthwise);
+            }
         }
 
-        ASSERT(convert_dst->type == dst->type);
-        std::copy(dst->ne, dst->ne + GGML_MAX_DIMS, convert_dst->ne);
-        std::copy(dst->nb, dst->nb + GGML_MAX_DIMS, convert_dst->nb);
+    convert_dst->type = dst_tensor_type;
+    std::copy(dst->ne, dst->ne + GGML_MAX_DIMS, convert_dst->ne);
+    std::copy(dst->nb, dst->nb + GGML_MAX_DIMS, convert_dst->nb);
 
         bool alloc_ok = ggml_gallocr_alloc_graph(gallocr.get(), graph);
         ASSERT(alloc_ok);
@@ -443,7 +563,9 @@ void model_transfer(
 
     ggml_context* dst_ctx = weights.context.get();
     bool to_cwhn = src_layout == tensor_data_layout::whcn && dst_layout == tensor_data_layout::cwhn;
-    tensor_converter convert(src_ctx, float_type, to_cwhn);
+    bool to_whcn = src_layout == tensor_data_layout::cwhn && dst_layout == tensor_data_layout::whcn;
+    int layout_conv = to_cwhn ? 1 : (to_whcn ? -1 : 0);
+    tensor_converter convert(src_ctx, float_type, layout_conv);
 
     tensor orig = ggml_get_first_tensor(src_ctx);
     for (int64_t i = 0, conv2d_idx = 0; orig;) {
@@ -452,8 +574,12 @@ void model_transfer(
             continue; // (why is there no way to iterate over GGUF tensors directly?)
         }
         auto ne = nelements(orig);
-        if (to_cwhn && conv2d_idx < ssize(conv2d_weights) && conv2d_weights[conv2d_idx] == i) {
-            permute_whcn_to_cwhn(ne.data(), ne[2] == 1);
+        if (conv2d_idx < ssize(conv2d_weights) && conv2d_weights[conv2d_idx] == i) {
+            if (layout_conv > 0) {
+                permute_whcn_to_cwhn(ne.data(), ne[2] == 1);
+            } else if (layout_conv < 0) {
+                permute_cwhn_to_whcn(ne.data(), ne[2] == 1);
+            }
             ++conv2d_idx;
         }
         tensor dup = ggml_new_tensor(dst_ctx, convert.target_type(orig), GGML_MAX_DIMS, ne.data());
@@ -467,6 +593,8 @@ void model_transfer(
     weights.buffer_type = device.type();
     if (to_cwhn) {
         weights.flags |= model_build_flag::cwhn;
+    } else if (to_whcn) {
+        weights.flags = weights.flags & ~model_build_flags(model_build_flag::cwhn);
     }
 
     tensor src = ggml_get_first_tensor(src_ctx);
@@ -480,7 +608,7 @@ void model_transfer(
         if (is_2d) {
             ++conv2d_idx;
         }
-        void const* data = convert(src, dst, is_2d && to_cwhn);
+    void const* data = convert(src, dst, is_2d && layout_conv != 0);
         ggml_backend_tensor_set(dst, data, 0, ggml_nbytes(dst));
         src = ggml_get_next_tensor(src_ctx, src);
         dst = ggml_get_next_tensor(dst_ctx, dst);
@@ -546,25 +674,29 @@ model_ref::model_ref(model_weights& m)
     : weights_context(m.context.get()),
       graph_context(m.context.get()),
       graph(nullptr),
-      flags(m.flags | backend_default_flags(m.buffer_type)) {}
+      flags(m.flags | backend_default_flags(m.buffer_type)),
+            backend(m.buffer_type) {}
 
 model_ref::model_ref(model_weights& m, compute_graph& g)
     : weights_context(m.context.get()),
       graph_context(g.context.get()),
       graph(g.graph),
-      flags(m.flags | backend_default_flags(m.buffer_type)) {}
+      flags(m.flags | backend_default_flags(m.buffer_type)),
+            backend(m.buffer_type) {}
 
 model_ref::model_ref(
     ggml_context* weights_context,
     ggml_context* graph_context,
     ggml_cgraph* graph,
     model_build_flags flags,
-    tensor_name prefix)
+    tensor_name prefix,
+    backend_type backend)
     : weights_context(weights_context),
       graph_context(graph_context ? graph_context : weights_context),
       graph(graph),
       flags(flags),
-      prefix(prefix) {}
+      prefix(prefix),
+      backend(backend) {}
 
 tensor model_ref::find(char const* name) const {
     auto full_name = tensor_name();
@@ -582,7 +714,7 @@ tensor model_ref::weights(char const* name) const {
 }
 
 model_ref model_ref::with_prefix(tensor_name new_prefix) const {
-    return model_ref{weights_context, graph_context, graph, flags, new_prefix};
+    return model_ref{weights_context, graph_context, graph, flags, new_prefix, backend};
 }
 
 template <typename Stringable>
@@ -747,6 +879,47 @@ tensor slice(model_ref const& m, tensor x, slice_t s0, slice_t s1, slice_t s2, s
 
 tensor concat(model_ref const& m, std::array<tensor, GGML_MAX_SRC> src, int dim) {
     int n = (int)std::count_if(src.begin(), src.end(), [](tensor t) { return t != nullptr; });
+
+    // On CUDA, certain concat kernels currently require F32 inputs. If all inputs are
+    // floating-point and share the same non-F32 dtype (e.g., F16), temporarily promote
+    // to F32 for the concat and cast back to the original dtype to preserve model dtypes.
+    bool needs_high_precision_concat = false;
+    ggml_type original_type = GGML_TYPE_COUNT; // invalid sentinel
+    if (m.backend == backend_type::cuda && n > 0) {
+        original_type = src[0]->type;
+        bool all_float = true;
+        bool all_same_type = true;
+        for (int i = 0; i < n; ++i) {
+            if (!is_float_type(src[i]->type)) {
+                all_float = false;
+                break;
+            }
+            if (src[i]->type != original_type) {
+                all_same_type = false;
+            }
+        }
+        needs_high_precision_concat = all_float && all_same_type && original_type != GGML_TYPE_F32;
+    }
+
+    if (needs_high_precision_concat) {
+        std::array<tensor, GGML_MAX_SRC> src_cast{};
+        for (int i = 0, j = 0; i < (int)src.size(); ++i) {
+            if (src[i] == nullptr) continue;
+            src_cast[j++] = ggml_cast(m, src[i], GGML_TYPE_F32);
+        }
+
+        tensor x;
+        if (m.flags & model_build_flag::concat_n) {
+            x = ggml_concat_n(m, src_cast.data(), n, dim);
+        } else {
+            x = src_cast[0];
+            for (int i = 1; i < n; ++i) {
+                x = ggml_concat(m, x, src_cast[i], dim);
+            }
+        }
+        return ggml_cast(m, x, original_type);
+    }
+
     if (m.flags & model_build_flag::concat_n) {
         return ggml_concat_n(m, src.data(), n, dim);
     } else {
@@ -759,11 +932,46 @@ tensor concat(model_ref const& m, std::array<tensor, GGML_MAX_SRC> src, int dim)
 }
 
 tensor interpolate(model_ref const& m, tensor x, i64x2 target, int32_t mode) {
-    if ((m.flags & model_build_flag::cwhn) && mode == GGML_SCALE_MODE_NEAREST) {
-        return ggml_interpolate(m, x, x->ne[0], target[0], target[1], x->ne[3], mode);
+    // Promote to F32 for CUDA only; Vulkan stays in requested type unless kernels require otherwise
+    // Allow override via visp_set_cuda_allow_f16_interpolation(true) to keep FP16 for bilinear/bicubic when safe
+    bool use_high_precision =
+        (m.backend == backend_type::cuda) && !g_cuda_allow_f16_interp &&
+        is_float_type(x->type) && x->type != GGML_TYPE_F32 &&
+        ((mode & GGML_SCALE_MODE_BILINEAR) || (mode & GGML_SCALE_MODE_BICUBIC));
+    tensor original = x;
+    if (use_high_precision) {
+        x = ggml_cast(m, x, GGML_TYPE_F32);
     }
-    // Bilinear interpolation requires WHCN layout!
-    return ggml_interpolate(m, x, target[0], target[1], x->ne[2], x->ne[3], mode);
+
+    tensor result;
+    if ((m.flags & model_build_flag::cwhn) && mode == GGML_SCALE_MODE_NEAREST) {
+        result = ggml_interpolate(m, x, x->ne[0], target[0], target[1], x->ne[3], mode);
+    } else {
+        // Bilinear interpolation requires WHCN layout!
+        result = ggml_interpolate(m, x, target[0], target[1], x->ne[2], x->ne[3], mode);
+    }
+
+    if (use_high_precision) {
+        result = ggml_cast(m, result, original->type);
+    }
+    return result;
+}
+
+} // namespace visp
+
+// Runtime setters
+namespace visp {
+
+void visp_set_cuda_graphs_enabled(bool enable) {
+    g_cuda_graphs_enabled = enable ? 1 : 0;
+}
+
+void visp_set_cuda_allow_f16_interpolation(bool allow) {
+    g_cuda_allow_f16_interp = allow ? 1 : 0;
+}
+
+void visp_set_flash_attention_enabled(bool enable) {
+    g_flash_attention_enabled = enable ? 1 : 0;
 }
 
 } // namespace visp

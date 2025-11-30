@@ -1,19 +1,32 @@
 #include "visp/vision.h"
 #include "util/math.h"
 #include "util/string.h"
+#include <cstdlib>
 
 namespace visp {
+
+// Helper to resolve requested weight precision. If the caller provides GGML_TYPE_COUNT,
+// use the backend's preferred float type; otherwise honor the explicit request.
+static ggml_type resolve_weight_type(backend_device const& dev, ggml_type requested) {
+    if (requested == GGML_TYPE_COUNT) {
+        return dev.preferred_float_type();
+    }
+    return requested;
+}
 
 //
 // Mobile SAM
 
-sam_model sam_load_model(char const* filepath, backend_device const& dev) {
+sam_model sam_load_model(char const* filepath, backend_device const& dev, ggml_type requested_type) {
     sam_model model;
     model.backend = &dev;
     model_file file = model_load(filepath);
     model.params = sam_params{};
     model.weights = model_init(file.n_tensors());
-    model_transfer(file, model.weights, dev, dev.preferred_float_type(), dev.preferred_layout());
+    ggml_type weight_type = resolve_weight_type(dev, requested_type);
+    tensor_data_layout layout =
+        (dev.type() == backend_type::cuda) ? tensor_data_layout::cwhn : dev.preferred_layout();
+    model_transfer(file, model.weights, dev, weight_type, layout);
     return model;
 }
 
@@ -79,13 +92,14 @@ image_data sam_compute(sam_model& model, box_2d box) {
 //
 // BiRefNet
 
-birefnet_model birefnet_load_model(char const* filepath, backend_device const& dev) {
+birefnet_model birefnet_load_model(char const* filepath, backend_device const& dev, ggml_type requested_type) {
     birefnet_model model;
     model.backend = &dev;
     model_file file = model_load(filepath);
     model.params = birefnet_detect_params(file, {1024, 1024});
     model.weights = model_init(file.n_tensors());
-    model_transfer(file, model.weights, dev, dev.preferred_float_type(), dev.preferred_layout());
+    ggml_type weight_type = resolve_weight_type(dev, requested_type);
+    model_transfer(file, model.weights, dev, weight_type, dev.preferred_layout());
     return model;
 }
 
@@ -118,13 +132,18 @@ image_data birefnet_compute(birefnet_model& model, image_view image) {
 //
 // Depth Anything
 
-depthany_model depthany_load_model(char const* filepath, backend_device const& dev) {
+depthany_model depthany_load_model(char const* filepath, backend_device const& dev, ggml_type requested_type) {
     depthany_model model;
     model.backend = &dev;
     model_file file = model_load(filepath);
     model.params = depthany_detect_params(file);
     model.weights = model_init(file.n_tensors());
-    model_transfer(file, model.weights, dev, dev.preferred_float_type(), dev.preferred_layout());
+    ggml_type weight_type = resolve_weight_type(dev, requested_type);
+    tensor_data_layout layout = dev.preferred_layout();
+    if (dev.type() == backend_type::cuda) {
+        layout = tensor_data_layout::cwhn;
+    }
+    model_transfer(file, model.weights, dev, weight_type, layout);
     return model;
 }
 
@@ -153,14 +172,19 @@ image_data depthany_compute(depthany_model& model, image_view image) {
 //
 // MI-GAN
 
-migan_model migan_load_model(char const* filepath, backend_device const& dev) {
+migan_model migan_load_model(char const* filepath, backend_device const& dev, ggml_type requested_type) {
     migan_model model;
     model.backend = &dev;
     model_file file = model_load(filepath);
     model.params = migan_detect_params(file);
     model.params.invert_mask = true; // inpaint opaque areas
     model.weights = model_init(file.n_tensors());
-    model_transfer(file, model.weights, dev, dev.preferred_float_type(), dev.preferred_layout());
+    ggml_type weight_type = resolve_weight_type(dev, requested_type);
+    tensor_data_layout layout = dev.preferred_layout();
+    if (dev.type() == backend_type::cuda) {
+        layout = tensor_data_layout::cwhn;
+    }
+    model_transfer(file, model.weights, dev, weight_type, layout);
     return model;
 }
 
@@ -191,13 +215,25 @@ image_data migan_compute(migan_model& model, image_view image, image_view mask) 
 
 constexpr int esrgan_default_tile_size = 224;
 
-esrgan_model esrgan_load_model(char const* filepath, backend_device const& dev) {
+esrgan_model esrgan_load_model(char const* filepath, backend_device const& dev, ggml_type requested_type) {
     esrgan_model model;
     model.backend = &dev;
     model_file file = model_load(filepath);
     model.params = esrgan_detect_params(file);
     model.weights = model_init(file.n_tensors());
-    model_transfer(file, model.weights, dev, dev.preferred_float_type(), dev.preferred_layout());
+    ggml_type weight_type = resolve_weight_type(dev, requested_type);
+    // On CUDA, keep ESRGAN weights in F32 to avoid F16 activations triggering F32-only CUDA kernels (e.g., scale)
+    if (dev.type() == backend_type::cuda) {
+        weight_type = GGML_TYPE_F32;
+    }
+    tensor_data_layout layout = dev.preferred_layout();
+    if (dev.type() == backend_type::cuda) {
+        layout = tensor_data_layout::cwhn;
+    }
+    model_transfer(
+        file, model.weights, dev,
+        weight_type,
+        layout);
     return model;
 }
 
@@ -210,6 +246,7 @@ image_data esrgan_compute(esrgan_model& model, image_view image) {
         model_ref m(model.weights, model.graph);
         i64x4 input_shape = {3, tiles.tile_size[0], tiles.tile_size[1], 1};
         model.input = compute_graph_input(m, GGML_TYPE_F32, input_shape);
+        // Keep compute in F32 for stability across all backends
         model.output = esrgan_generate(m, model.input, model.params);
 
         compute_graph_allocate(model.graph, *model.backend);

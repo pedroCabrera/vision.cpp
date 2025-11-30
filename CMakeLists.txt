@@ -3,11 +3,27 @@ cmake_minimum_required(VERSION 3.28)
 project(vision.cpp VERSION 0.2.0 LANGUAGES CXX)
 
 option(VISP_VULKAN "Enable Vulkan support" OFF)
+option(VISP_CUDA "Enable CUDA support" OFF)
+option(VISP_CUDA_GRAPHS "Enable CUDA Graphs by default (can be overridden by GGML_CUDA_DISABLE_GRAPHS env)" OFF)
 option(VISP_DEV "Enable development mode" OFF)
 option(VISP_CI "Enable for continuous integration environment" OFF)
 option(VISP_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
 option(VISP_FMT_LIB "Use external fmt library instead of standard C++ <format>" OFF)
 option(VISP_ASAN "Enable AddressSanitizer" OFF)
+
+set(VISP_DEFINITIONS)
+
+if(VISP_VULKAN)
+  list(APPEND VISP_DEFINITIONS VISP_VULKAN=1)
+endif()
+
+if(VISP_CUDA)
+  list(APPEND VISP_DEFINITIONS VISP_CUDA=1)
+endif()
+
+if(VISP_CUDA_GRAPHS)
+  list(APPEND VISP_DEFINITIONS VISP_CUDA_GRAPHS=1)
+endif()
 
 if(PROJECT_IS_TOP_LEVEL)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -82,6 +98,7 @@ if(VISP_FMT_LIB)
 endif()
 
 set(GGML_VULKAN ${VISP_VULKAN})
+set(GGML_CUDA ${VISP_CUDA})
 set(GGML_LLAMAFILE ON)
 if(VISP_CI)
   set(GGML_BACKEND_DL ON)

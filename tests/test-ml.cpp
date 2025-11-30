@@ -1,16 +1,31 @@
 #include "testing.h"
 #include "visp/ml.h"
+#include "visp/nn.h"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <numeric>
+#include <vector>
 
 namespace visp {
-
-VISP_TEST(backend_available) {
+#ifdef VISP_VULKAN
+VISP_TEST(backend_available_vulkan) {
     CHECK(backend_is_available(backend_type::cpu));
     if (backend_is_available(backend_type::gpu)) {
         CHECK(backend_is_available(backend_type::vulkan));
     }
 }
+#endif
+#ifdef VISP_CUDA
+VISP_TEST(backend_available_cuda) {
+    CHECK(backend_is_available(backend_type::cpu));
+    if (backend_is_available(backend_type::gpu)) {
+        CHECK(backend_is_available(backend_type::cuda));
+    }
+}
+#endif
+
 
 VISP_TEST(model_transfer_type_conversion) {
     model_weights src = model_init(2);
@@ -98,5 +113,118 @@ VISP_TEST(model_transfer_layout_conversion) {
     CHECK_EQUAL(no_conv_result[0], 1.0f);
     CHECK_EQUAL(no_conv_result[1], 2.0f);
 }
+
+#ifdef VISP_CUDA
+VISP_TEST(conv2d_deform_cuda_matches_cpu) {
+    if (!backend_is_available(backend_type::cuda)) {
+        throw test_skip{"CUDA backend not available"};
+    }
+
+    struct test_case {
+        int src_w;
+        int src_h;
+        int c_in;
+        int c_out;
+        int kw;
+        int kh;
+        int stride;
+        int pad;
+        int batch;
+    };
+
+    const std::array test_cases{
+        test_case{8, 6, 4, 3, 3, 3, 1, 1, 1},
+        test_case{32, 32, 64, 256, 1, 1, 1, 0, 1},
+    };
+
+    auto fill_with = [](std::vector<float>& data, float scale, float step) {
+        for (size_t i = 0; i < data.size(); ++i) {
+            float angle = step * float(i);
+            data[i] = static_cast<float>(scale * std::sin(angle));
+        }
+    };
+
+    auto run_backend = [&](backend_type backend, test_case const& cfg) {
+        const int dst_w = (cfg.src_w + 2 * cfg.pad - cfg.kw) / cfg.stride + 1;
+        const int dst_h = (cfg.src_h + 2 * cfg.pad - cfg.kh) / cfg.stride + 1;
+
+        const size_t input_elems = size_t(cfg.src_w) * cfg.src_h * cfg.c_in * cfg.batch;
+        const size_t weight_elems = size_t(cfg.kw) * cfg.kh * cfg.c_in * cfg.c_out;
+        const size_t offset_elems = size_t(dst_w) * dst_h * 2 * cfg.kw * cfg.kh * cfg.batch;
+        const size_t mask_elems = size_t(dst_w) * dst_h * cfg.kw * cfg.kh * cfg.batch;
+
+        std::vector<float> input_data(input_elems);
+        std::vector<float> weight_data(weight_elems);
+        std::vector<float> offset_data(offset_elems);
+        std::vector<float> mask_data(mask_elems);
+
+        fill_with(input_data, 0.7f, 0.01f);
+        fill_with(weight_data, 0.5f, 0.02f);
+        fill_with(offset_data, 0.25f, 0.005f);
+        fill_with(mask_data, 0.5f, 0.015f);
+        for (float& v : mask_data) {
+            v = 0.5f + v; // keep weights positive to avoid degenerate zero masks
+        }
+
+        backend_device dev = backend_init(backend);
+        model_weights weights = model_init(4);
+        weights.buffer_type = backend;
+        compute_graph graph = compute_graph_init();
+        model_ref m(weights, graph);
+        m.backend = backend;
+
+        tensor weight = ggml_new_tensor_4d(
+            m.weights_context, GGML_TYPE_F32, cfg.kw, cfg.kh, cfg.c_in, cfg.c_out);
+        ggml_set_name(weight, "conv.weight");
+
+        tensor offset = ggml_new_tensor_4d(
+            m.weights_context, GGML_TYPE_F32, dst_w, dst_h, 2 * cfg.kw * cfg.kh, cfg.batch);
+        ggml_set_name(offset, "offset");
+
+        tensor mask = ggml_new_tensor_4d(
+            m.weights_context, GGML_TYPE_F32, dst_w, dst_h, cfg.kw * cfg.kh, cfg.batch);
+        ggml_set_name(mask, "mask");
+
+        model_allocate(weights, dev);
+        transfer_to_backend(weight, span<const float>(weight_data));
+        transfer_to_backend(offset, span<const float>(offset_data));
+        transfer_to_backend(mask, span<const float>(mask_data));
+
+        tensor input = compute_graph_input(
+            m, GGML_TYPE_F32, i64x4{cfg.src_w, cfg.src_h, cfg.c_in, cfg.batch}, "input");
+
+        tensor output = conv_2d_deform(
+            m, input, weight, offset, mask, cfg.stride, cfg.pad);
+        output = compute_graph_output(m, output, "output");
+
+        compute_graph_allocate(graph, dev);
+        transfer_to_backend(input, span<const float>(input_data));
+        compute(graph, dev);
+
+        tensor_data result = transfer_from_backend(output);
+        auto span_f32 = result.as_f32();
+        return std::vector<float>(span_f32.begin(), span_f32.end());
+    };
+
+    for (test_case const& cfg : test_cases) {
+        auto cpu = run_backend(backend_type::cpu, cfg);
+        auto cuda = run_backend(backend_type::cuda, cfg);
+
+        ASSERT(cpu.size() == cuda.size(), "Mismatched output sizes");
+        float max_abs = 0.0f;
+        double sum_sq = 0.0;
+        for (size_t i = 0; i < cpu.size(); ++i) {
+            float diff = cpu[i] - cuda[i];
+            max_abs = std::max(max_abs, std::abs(diff));
+            sum_sq += diff * diff;
+        }
+    float rmse = static_cast<float>(std::sqrt(sum_sq / double(cpu.size())));
+        test_set_info(format(
+            "{}x{}x{} -> {} rmse={} max_abs={}",
+            cfg.src_w, cfg.src_h, cfg.c_in, cfg.c_out, rmse, max_abs));
+        CHECK(max_abs < 1e-4f);
+    }
+}
+#endif // VISP_CUDA
 
 } // namespace visp
